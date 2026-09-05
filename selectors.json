@@ -1,0 +1,8 @@
+{
+  "login_url": "[https://bot.sannysoft.com](https://bot.sannysoft.com)",
+  "username_input": "input[name='username']",
+  "password_input": "input[name='password']",
+  "submit_button": "button#submit-btn",
+  "statements_tab": "a#statements-link",
+  "download_btn": ".download-statement button"
+}
