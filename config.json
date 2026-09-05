@@ -1,0 +1,35 @@
+{
+  "bank_name": "Google Account Test Flow",
+  "login_url": "https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin",
+  "download_dir": "C:\\Temp",
+  "timeout_seconds": 12,
+  "flow_steps": [
+    {
+      "step_name": "enter_email",
+      "action": "type",
+      "selector": "input#identifierId",
+      "value_env": "TEST_GMAIL_USER"
+    },
+    {
+      "step_name": "click_next_email",
+      "action": "click",
+      "selector": "#identifierNext"
+    },
+    {
+      "step_name": "wait_for_password_transition",
+      "action": "sleep",
+      "duration": 4
+    },
+    {
+      "step_name": "enter_password",
+      "action": "type",
+      "selector": "input[type='password']",
+      "value_env": "TEST_GMAIL_PASS"
+    },
+    {
+      "step_name": "click_next_password",
+      "action": "click",
+      "selector": "#passwordNext"
+    }
+  ]
+}
