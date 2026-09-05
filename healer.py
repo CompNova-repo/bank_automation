@@ -219,3 +219,69 @@ async def heal_and_update_config(page, config_path: str, failed_step_index: int)
 # Backwards-compat alias (old runner imported this name)
 async def heal_selector(page, config_path: str, failed_step_index: int) -> str:
     return await heal_and_update_config(page, config_path, failed_step_index)
+
+
+def discover_selector(dom_context: str, intent: str) -> str:
+    """
+    Queries the LLM to locate the single best CSS selector matching a high-level
+    semantic intent. Used on first run when config.json has empty selectors.
+    """
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OPENROUTER_API_KEY is not set.")
+
+    prompt = f"""You are an expert browser automation engine.
+Your goal is to inspect the current page's interactive elements and find the single best CSS selector matching this intent:
+
+Target Intent: "{intent}"
+
+Live Visible DOM Elements:
+---
+{dom_context}
+---
+
+Rules:
+1. Return ONLY the most robust, unique CSS selector matching the intent.
+2. Prefer unique attributes in order: #id, [name='...'], [placeholder='...'], [aria-label='...'], or '#containerId button'.
+3. Do not return markdown ticks or explanations. Output the raw CSS selector only."""
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:9000",
+        "X-Title": "Bank-RPA-Discovery"
+    }
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0
+    }
+
+    resp = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=25)
+    resp.raise_for_status()
+    res = resp.json()["choices"][0]["message"]["content"].strip().replace("`", "").strip()
+    return res.split("\n")[0].strip('"').strip("'")
+
+
+async def populate_and_save_selector(page, config_path: str, step_index: int) -> str:
+    """
+    Discovers the element matching a step's semantic intent, persists it into
+    config.json, and returns the new selector. Used on first run when a step
+    has an empty selector.
+    """
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    step = config["flow_steps"][step_index]
+    intent = step.get("intent", step["step_name"])
+
+    print(f"\n[AI Discovery] Searching for element matching intent: '{intent}'...")
+    dom = await extract_interactive_dom(page)
+    new_selector = discover_selector(dom, intent)
+    print(f"[AI Discovery] Discovered and mapped: '{new_selector}'")
+
+    config["flow_steps"][step_index]["selector"] = new_selector
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    return new_selector

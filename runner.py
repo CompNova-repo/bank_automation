@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import nodriver as uc
-from healer import heal_and_update_config
+from healer import heal_and_update_config, populate_and_save_selector
 
 USER_DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "C:\\Temp"), "Test_RPA_Profile")
 CONFIG_PATH = "config.json"
@@ -75,6 +75,12 @@ async def run_automation():
                 continue
 
             selector = step["selector"]
+
+            # 1. First-run discovery: empty selector -> ask AI to populate from intent
+            if not selector.strip():
+                print(f"[?] Step '{step_name}' has no selector. Auto-discovering from intent...")
+                selector = await populate_and_save_selector(page, CONFIG_PATH, idx)
+                step["selector"] = selector
 
             print(f"[>] Executing step: '{step_name}' ({action}) targeting '{selector}'...")
 
