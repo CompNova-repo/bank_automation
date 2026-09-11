@@ -92,6 +92,11 @@ class StateProvider:
     error_url_markers: List[str]
     prompt_sent_indicators: List[str]  # visible-text substrings
     error_indicators: List[str]        # visible-text substrings
+    password_challenge_markers: List[str] = None  # URLs indicating still on password step
+
+    def __post_init__(self):
+        if self.password_challenge_markers is None:
+            self.password_challenge_markers = []
 
     @classmethod
     def from_config(cls, cfg: dict) -> "StateProvider":
@@ -118,6 +123,8 @@ class StateProvider:
                 "error_indicators",
                 ["couldn't sign you in", "wrong password",
                  "this browser or app may not be secure"])),
+            password_challenge_markers=list(sp.get(
+                "password_challenge_markers", ["challenge/pwd"])),
         )
 
     def classify(self, url: str, page_text: str, chooser: bool) -> AuthState:
@@ -142,6 +149,12 @@ class StateProvider:
             # confirm it. Could be a Google quirk where data-* attrs haven't
             # painted yet — classify as CHOOSER and let the runner poll.
             return AuthState.CHOOSER
+        # Check for password challenge URLs - these indicate we're still
+        # on the password step, not yet at 2FA stage.
+        if any(m in u for m in self.password_challenge_markers):
+            return AuthState.TRANSITIONING
+        # Check for other challenge types that indicate an active 2FA challenge
+        # (TOTP, security key, etc.) but NOT password challenges.
         if any(m in u for m in self.challenge_url_markers):
             return AuthState.CHALLENGE_ACTIVE
         return AuthState.UNKNOWN

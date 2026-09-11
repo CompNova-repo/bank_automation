@@ -197,7 +197,9 @@ class StateProviderClassifierTests(unittest.TestCase):
             AuthState.ERROR,
         )
 
-    def test_transitioning_when_nothing_recognized(self):
+    def test_transitioning_when_on_password_challenge(self):
+        """URL is challenge/pwd which means we're still on password step,
+        not yet at 2FA stage. Should be classified as TRANSITIONING."""
         sp = PROVIDER
         self.assertEqual(
             sp.classify(
@@ -205,7 +207,7 @@ class StateProviderClassifierTests(unittest.TestCase):
                 "",
                 chooser=False,
             ),
-            AuthState.CHALLENGE_ACTIVE,
+            AuthState.TRANSITIONING,
         )
 
 

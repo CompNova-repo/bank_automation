@@ -25,6 +25,9 @@
       "chooser_url_markers": [
         "challenge/selection"
       ],
+      "password_challenge_markers": [
+        "challenge/pwd"
+      ],
       "error_url_markers": [
         "accounts.google.com/v3/signin/rejected"
       ],

@@ -1,5 +1,1 @@
-.venv/
-venv/
-__pycache__/
-.env
-*.log
+Nothing should be ignored since the changes only include source/config files (.json, .py) without any build artifacts, dependencies, or temp files.
