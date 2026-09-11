@@ -2,7 +2,10 @@ import os
 import json
 import asyncio
 import nodriver as uc
+from dotenv import load_dotenv
 from healer import heal_and_update_config, populate_and_save_selector
+
+load_dotenv()
 
 USER_DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "C:\\Temp"), "Test_RPA_Profile")
 CONFIG_PATH = "config.json"
