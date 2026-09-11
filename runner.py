@@ -217,11 +217,34 @@ async def reliable_type(page, selector: str, text: str, timeout: float = 8):
 async def reliable_click(page, selector: str, timeout: float = 8):
     """
     Scrolls to and clicks the target element.
+    Uses query_selector with explicit wait to handle dynamic elements.
     """
+    # First try standard select
     el = await page.select(selector, timeout=timeout)
+    
+    # Fallback: use query_selector with manual wait for Google's dynamic buttons
+    if not el:
+        import asyncio
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                el = await page.query_selector(selector)
+                if el:
+                    break
+            except Exception:
+                pass
+            await page.sleep(0.3)
+    
     if not el:
         raise TimeoutError(f"Button element '{selector}' not found.")
 
+    # Scroll into view and click
+    try:
+        await el.scroll_into_view()
+        await page.sleep(0.2)
+    except Exception:
+        pass
+    
     await el.click()
     await page.sleep(1.5)
 
