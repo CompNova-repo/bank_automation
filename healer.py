@@ -57,6 +57,42 @@ MODEL_NAME = os.environ.get("HEALER_MODEL", "qwen/qwen3.7-flash")
 OPENROUTER_MAX_ATTEMPTS = int(os.environ.get("OPENROUTER_MAX_ATTEMPTS", "3"))
 OPENROUTER_BACKOFF_SECONDS = float(os.environ.get("OPENROUTER_BACKOFF_SECONDS", "2.0"))
 
+# Verbose / debug logging for the LLM helpers. When enabled, every raw LLM
+# reply is dumped (untruncated) and `_diagnose_llm_response` runs sanity
+# checks (refusal phrases, hallucinated method names, broken JSON syntax).
+# Useful when chasing "automation silently ended on password page" type bugs.
+HEALER_DEBUG = os.environ.get("HEALER_DEBUG", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Phrases that strongly suggest the model is refusing rather than returning
+# data. Kept conservative — these are the patterns we have actually seen from
+# qwen/qwen3.7-flash when it cannot decide what to click.
+_REFUSAL_PHRASES = (
+    "i cannot decide",
+    "i can't decide",
+    "i cannot choose",
+    "i can't choose",
+    "i am unable",
+    "i'm unable",
+    "as an ai",
+    "i do not have enough information",
+    "insufficient information",
+)
+
+# Method/action names that have appeared in hallucinated outputs from smaller
+# models. None of these are valid CSS selectors — when one shows up the
+# caller knows the LLM response is junk and should not be persisted.
+_INVALID_METHOD_TOKENS = (
+    "fix_it_with_magic",
+    "do_magic",
+    "use_magic",
+    "auto_fix",
+    "magic_select",
+    "fix_all",
+    "click_any",
+)
+
 
 class DiscoveryStatus(str, Enum):
     """Result categories returned by `populate_and_save_text_target`."""
@@ -651,6 +687,65 @@ def _post_with_retry(payload: dict, headers: dict, label: str) -> dict:
     )
 
 
+def _diagnose_llm_response(content: str, label: str) -> None:
+    """Verbose dump + sanity checks for a raw LLM reply.
+
+    Always silent when HEALER_DEBUG is off. When HEALER_DEBUG is on:
+      * Prints the FULL untruncated response so you can see exactly what the
+        model emitted (the per-caller "no parsable selectors" log line is
+        truncated to 300/400 chars).
+      * Flags well-known refusal patterns ("I cannot decide", ...).
+      * Flags hallucinated method names ("method": "fix_it_with_magic", ...).
+      * Flags outputs that look like JSON but fail to parse.
+
+    This is the entry point to check when chasing "automation ends silently
+    on the password page" type bugs — the raw LLM reply is dumped here.
+    """
+    if not HEALER_DEBUG:
+        return
+    if content is None:
+        print(f"[AI Healer][DEBUG] === Raw LLM response ({label}) === "
+              f"<NoneType> ===")
+        return
+    print(f"\n[AI Healer][DEBUG] === Raw LLM response ({label}) "
+          f"len={len(content)} ===")
+    print(content)
+    print(f"[AI Healer][DEBUG] === End raw response ({label}) ===\n")
+
+    lower = (content or "").lower()
+    # Refusal detection.
+    for phrase in _REFUSAL_PHRASES:
+        if phrase in lower:
+            print(f"[AI Healer][DEBUG] WARN: refusal phrase detected "
+                  f"({phrase!r}). Model is declining rather than picking a "
+                  f"selector. Prompt may need more grounding.")
+            break
+    # Hallucinated method/action names.
+    for tok in _INVALID_METHOD_TOKENS:
+        if tok in lower:
+            print(f"[AI Healer][DEBUG] WARN: hallucinated token {tok!r} "
+                  f"present in response. Not a valid CSS selector.")
+    if '"method"' in lower and 'magic' in lower:
+        print(f"[AI Healer][DEBUG] WARN: response contains a "
+                  f"'method'-shaped JSON field that looks fabricated.")
+    # JSON syntax sanity check. Only run when the output *looks* like JSON
+    # so we do not nag at the (perfectly fine) bare-selector responses that
+    # this codebase's prompts deliberately produce: [#id, #id, ...] with no
+    # quoting. A response that contains `"key":` style fields is genuinely
+    # trying to be JSON and should be parsed cleanly.
+    stripped = content.strip().strip("`")
+    looks_like_json = (
+        stripped.startswith("{")
+        or ('"' in stripped and (stripped.startswith("[") or '":' in stripped))
+    )
+    if looks_like_json:
+        try:
+            json.loads(stripped)
+        except Exception as e:
+            print(f"[AI Healer][DEBUG] WARN: output looks like JSON but "
+                  f"failed to parse: {e}")
+
+
 def ask_openrouter_candidates(dom_context: str, step_name: str, failed_selector: str,
                               page_url: str = "") -> List[str]:
     if not OPENROUTER_API_KEY:
@@ -692,6 +787,7 @@ Rules:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise DiscoveryError(f"unexpected OpenRouter response shape: {e}")
+    _diagnose_llm_response(content, label="repair-selector")
     cands = _parse_candidates(content)
     if not cands:
         print(f"[AI Healer] Raw LLM response (no parsable selectors): {content[:300]}")
@@ -764,6 +860,7 @@ CRITICAL rules:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise DiscoveryError(f"unexpected OpenRouter response shape: {e}")
+    _diagnose_llm_response(content, label="repair-text-target")
     parsed = _parse_candidates(content)
     if not parsed:
         print(f"[AI Healer] Raw LLM response (no parsable selectors): {content[:400]}")
@@ -944,9 +1041,11 @@ Rules:
 
     data = _post_with_retry(payload, headers, label="discover-selector")
     try:
-        res = data["choices"][0]["message"]["content"].strip().replace("`", "").strip()
+        raw_content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise DiscoveryError(f"unexpected OpenRouter response shape: {e}")
+    _diagnose_llm_response(raw_content, label="discover-selector")
+    res = raw_content.strip().replace("`", "").strip()
     return res.split("\n")[0].strip('"').strip("'")
 
 
