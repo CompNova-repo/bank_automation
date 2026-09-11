@@ -1,6 +1,47 @@
+"""
+healer.py — selector discovery and DOM inspection helpers.
+
+Provides:
+- `extract_interactive_dom` — DOM snapshot used as context for LLM selector repair.
+- `selector_exists` / `get_element_text` / `get_page_url` — small DOM probes.
+- `scroll_through_page` — forces lazy-loaded elements into the DOM.
+- `find_selector_by_text` — deterministic text-target selector finder.
+- `populate_and_save_selector` / `populate_and_save_text_target` — discovery
+  pipelines that fall back to the LLM and only persist *validated* selectors.
+- `ask_openrouter_candidates` / `ask_openrouter_candidates_text` — LLM callers.
+- `heal_and_update_config` — selector-repair helper invoked by the runner.
+
+Design intent:
+    ACTION execution  (run by runner.py)
+        vs.
+    STATE observation  (run by runner.py via state_machine.py helpers)
+        vs.
+    SELECTOR healing   (this module).
+
+Discovery distinguishes between three terminal outcomes that the runner
+needs to disambiguate:
+
+    FOUND             — a validated selector was returned.
+    EMPTY_GENUINE     — a chooser is genuinely not present
+                        (e.g. Google auto-sent the prompt, or auth
+                        already completed).
+    ERROR             — the LLM/network failed, or no candidate
+                        validated against the live DOM. We do NOT
+                        treat this as "nothing to click".
+
+The previous implementation conflated ERROR with EMPTY_GENUINE, which is
+the source of the observed `challenge/pwd → empty selector → timeout`
+regression.
+"""
+
 import os
 import json
 import re
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional, Tuple
+
 import requests
 from dotenv import load_dotenv
 
@@ -9,6 +50,38 @@ load_dotenv()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 MODEL_NAME = os.environ.get("HEALER_MODEL", "qwen/qwen3.7-flash")
 
+# Bounded retry/backoff for transient OpenRouter failures (429 / 5xx /
+# connection errors). The browser workflow does not depend on this — it
+# prefers deterministic DOM discovery — but we still try a few times
+# before giving up so a flaky key does not falsely look like "no candidates".
+OPENROUTER_MAX_ATTEMPTS = int(os.environ.get("OPENROUTER_MAX_ATTEMPTS", "3"))
+OPENROUTER_BACKOFF_SECONDS = float(os.environ.get("OPENROUTER_BACKOFF_SECONDS", "2.0"))
+
+
+class DiscoveryStatus(str, Enum):
+    """Result categories returned by `populate_and_save_text_target`."""
+
+    FOUND = "found"             # Validated selector returned and persisted.
+    EMPTY_GENUINE = "empty"     # No chooser visible. LLM (if called) confirmed it.
+    ERROR = "error"             # LLM/network/parse failure, or no candidate validated.
+    NOT_READY = "not_ready"     # The page has not yet reached the expected state.
+
+
+@dataclass
+class DiscoveryResult:
+    """Outcome of a discovery attempt.
+
+    `selector` is only meaningful when `status == FOUND`.
+    """
+
+    status: DiscoveryStatus
+    selector: Optional[str] = None
+    detail: str = ""
+
+
+# ---------------------------------------------------------------------------
+# DOM inspection
+# ---------------------------------------------------------------------------
 
 async def extract_interactive_dom(page, limit: int = 200):
     """
@@ -217,7 +290,7 @@ def _build_text_finder_js(text: str, match_type: str, tag_hint: str) -> str:
 
 
 async def find_selector_by_text(page, text: str, match_type: str = "contains",
-                                tag_hint: str = "li") -> str | None:
+                                tag_hint: str = "li") -> Optional[str]:
     """Run the text-finder JS and return the CSS selector it picks, or None."""
     if not text:
         return None
@@ -306,60 +379,123 @@ async def scroll_through_page(page, step_px: int = 400, max_steps: int = 8) -> N
         pass
 
 
-async def populate_and_save_text_target(page, config_path: str, step_index: int,
-                                        text: str = "", match_type: str = "contains",
-                                        tag_hint: str = "li") -> str | None:
+# ---------------------------------------------------------------------------
+# Chooser-visible probe — used to distinguish "chooser is here" from
+# "prompt already auto-sent". Both look like an idle page to a naive caller.
+# ---------------------------------------------------------------------------
+
+CHOOSER_PROBE_JS = """
+() => {
+    // Google wraps 2FA method options as <li data-challengetype="..."> elements.
+    // The chooser is the only place these appear together in meaningful numbers.
+    const items = document.querySelectorAll('[data-challengetype]');
+    if (items.length >= 2) {
+        const visible = Array.from(items).filter(el => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        });
+        if (visible.length >= 2) return true;
+    }
+    // Fallback: scan for a known chooser heading.
+    const headings = Array.from(document.querySelectorAll('h1, h2, div'))
+        .map(el => (el.innerText || '').trim().toLowerCase());
+    if (headings.some(t => t.indexOf('2-step verification') !== -1 ||
+                           t.indexOf('choose how') !== -1 ||
+                           t.indexOf('pick a way') !== -1 ||
+                           t.indexOf('select a method') !== -1)) {
+        return true;
+    }
+    return false;
+}
+"""
+
+
+async def is_chooser_visible(page) -> bool:
+    """Return True if the 2FA method chooser is on screen right now."""
+    try:
+        result = await page.evaluate(CHOOSER_PROBE_JS, return_by_value=True)
+        if isinstance(result, dict) and "value" in result:
+            result = result["value"]
+        return bool(result)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers — shared by discovery + healing paths
+# ---------------------------------------------------------------------------
+
+async def _validate_selector_against_target(page, selector: str, text: str,
+                                            match_type: str = "contains") -> bool:
+    """True iff the selector matches exactly one visible element whose text
+    contains the target (case-insensitive). When `text` is empty, only the
+    one-match requirement is enforced."""
+    if not selector:
+        return False
+    if not await selector_exists(page, selector):
+        return False
+    try:
+        count_js = "() => document.querySelectorAll(" + json.dumps(selector) + ").length"
+        n = await page.evaluate(count_js, return_by_value=True)
+        if isinstance(n, dict) and "value" in n:
+            n = n["value"]
+        if isinstance(n, (int, float)) and n != 1:
+            return False
+    except Exception:
+        pass
+    if not text:
+        return True
+    elem_text = await get_element_text(page, selector)
+    norm = lambda s: (s or "").replace("\s+", " ").strip().lower()
+    if match_type == "exact":
+        return norm(elem_text) == norm(text)
+    return norm(text) in norm(elem_text)
+
+
+# ---------------------------------------------------------------------------
+# Text-targeted discovery pipeline
+# ---------------------------------------------------------------------------
+
+async def populate_and_save_text_target(
+    page, config_path: str, step_index: int,
+    text: Optional[str] = None, match_type: Optional[str] = None,
+    tag_hint: Optional[str] = None,
+) -> DiscoveryResult:
     """
-    Discovers the element matching the step's intent, persists a CSS
-    selector for it into config.json, and returns that selector.
+    Discovers a text-targeted element (e.g. a 2FA method chooser entry),
+    persists a CSS selector for it into config.json, and returns a
+    DiscoveryResult describing the outcome.
 
     Pipeline:
       0. Scroll through the page so off-screen elements enter the DOM.
       1. JS text-finder scan (free, instant) — pick most-specific text match.
-      2. LLM call with full DOM + intent + page URL — let the model decide.
-      3. Validate each candidate (selector must match exactly one element
-         whose innerText actually contains the target text or overlaps
-         semantically with the intent).
-      4. Empty list = "nothing to click" (prompt already auto-sent). Persist
-         empty selector and return None so the runner can skip gracefully.
+      2. LLM call with full DOM + intent + page URL.
+      3. Validate each candidate against the live DOM (one element, text overlap).
+      4. Empty-list from LLM + no chooser visible -> EMPTY_GENUINE (no persist).
+      5. LLM failure / no validated candidate -> ERROR (no persist).
+
+    Caller-supplied `text` / `match_type` / `tag_hint` take precedence over
+    whatever is on the step in config.json. This fixes the propagation bug
+    where `runner.py`'s `resolve_2fa_text()` computed values never reached
+    this function.
     """
     with open(config_path, "r") as f:
         config = json.load(f)
 
     step = config["flow_steps"][step_index]
     intent = step.get("intent", step.get("step_name", ""))
-    # Defaults from step config if not passed.
-    if not text:
-        text = step.get("text", "")
-    if not match_type:
-        match_type = step.get("match_type", "contains")
-    if not tag_hint:
-        tag_hint = step.get("tag_hint", "")
+    # Caller overrides win; fall back to step fields.
+    if text is None:
+        text = step.get("text", "") or ""
+    if match_type is None:
+        match_type = step.get("match_type", "contains") or "contains"
+    if tag_hint is None or tag_hint == "":
+        tag_hint = step.get("tag_hint", "") or ""
 
     def _persist(sel):
         step["selector"] = sel
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
-
-    async def _validate(sel: str) -> bool:
-        if not sel or not await selector_exists(page, sel):
-            return False
-        try:
-            count_js = "() => document.querySelectorAll(" + json.dumps(sel) + ").length"
-            n = await page.evaluate(count_js, return_by_value=True)
-            if isinstance(n, dict) and "value" in n:
-                n = n["value"]
-            if isinstance(n, (int, float)) and n != 1:
-                return False
-        except Exception:
-            pass
-        if not text:
-            return True
-        elem_text = await get_element_text(page, sel)
-        norm = lambda s: (s or "").replace("\s+", " ").strip().lower()
-        if match_type == "exact":
-            return norm(elem_text) == norm(text)
-        return norm(text) in norm(elem_text)
 
     url = await get_page_url(page)
     print(f"\n[AI Discovery] Page URL: {url}")
@@ -371,25 +507,37 @@ async def populate_and_save_text_target(page, config_path: str, step_index: int,
 
     # 1) JS scanner (cheap path)
     discovered = await find_selector_by_text(page, text, match_type, tag_hint)
-    if discovered and await _validate(discovered):
+    if discovered and await _validate_selector_against_target(
+            page, discovered, text, match_type):
         print(f"[AI Discovery] Text-scan match: '{discovered}'")
         _persist(discovered)
-        return discovered
+        return DiscoveryResult(DiscoveryStatus.FOUND, discovered)
 
-    # 2) LLM with full DOM + URL context
-    dom = await extract_interactive_dom(page)
-    candidates = []
+    chooser_visible = await is_chooser_visible(page)
+
+    # 2) LLM with full DOM + URL context. Distinguish error vs empty.
+    candidates: List[str] = []
+    llm_err: Optional[str] = None
+    llm_called = False
     try:
-        candidates = ask_openrouter_candidates_text(dom, intent, text, match_type, tag_hint, url)
-    except Exception as e:
-        print(f"[AI Healer] LLM text-candidate call failed: {e}")
+        dom = await extract_interactive_dom(page)
+        candidates = ask_openrouter_candidates_text(
+            dom, intent, text, match_type, tag_hint, url)
+        llm_called = True
+    except DiscoveryError as e:
+        llm_err = str(e)
+        print(f"[AI Healer] LLM text-candidate call failed: {llm_err}")
+    except Exception as e:  # defensive — never crash the runner on LLM hiccups
+        llm_err = repr(e)
+        print(f"[AI Healer] LLM text-candidate call raised: {llm_err}")
 
     print(f"[AI Healer] LLM text-candidates: {candidates}")
+
     for cand in candidates:
-        if await _validate(cand):
+        if await _validate_selector_against_target(page, cand, text, match_type):
             print(f"[AI Healer] Repaired selector: '{cand}' (validated)")
             _persist(cand)
-            return cand
+            return DiscoveryResult(DiscoveryStatus.FOUND, cand)
 
     # 3) Lenient: token overlap with target text.
     for cand in candidates:
@@ -400,36 +548,113 @@ async def populate_and_save_text_target(page, config_path: str, step_index: int,
             elem_tokens = {t for t in elem_text.split() if len(t) > 2}
             overlap = len(target_tokens & elem_tokens)
             if target_tokens and overlap / len(target_tokens) >= 0.5:
-                print(f"[AI Healer] Lenient repair: '{cand}' (text overlap {overlap}/{len(target_tokens)})")
+                print(f"[AI Healer] Lenient repair: '{cand}' "
+                      f"(text overlap {overlap}/{len(target_tokens)})")
                 _persist(cand)
-                return cand
+                return DiscoveryResult(DiscoveryStatus.FOUND, cand)
 
-    # 4) LLM returned [] — interpret as "nothing to click". Persist empty.
-    if not candidates and not discovered:
-        print(f"[AI Discovery] LLM returned no candidates — likely nothing clickable on this page. "
-              f"Persisting empty selector; runner will skip.")
-        _persist("")
-        return ""
+    # 4) Empty-list from a successful LLM AND no chooser visible:
+    #    genuinely nothing to click right now (e.g. auto-sent prompt).
+    if not candidates and llm_called and not llm_err and not chooser_visible:
+        print(f"[AI Discovery] LLM returned [] and chooser not visible — "
+              f"no selection required. Not persisting.")
+        return DiscoveryResult(DiscoveryStatus.EMPTY_GENUINE, detail="no chooser / no candidates")
 
-    # 5) Persist whatever we have so the runner retry-loop can re-attempt.
-    if discovered:
-        print(f"[AI Healer] WARNING: persisting unvalidated JS-scan selector '{discovered}'.")
+    # 5) Chooser visible but we could not validate anything: that's an error,
+    #    not a genuine "nothing to click" — preserve any stored selector and
+    #    surface the failure to the caller.
+    if chooser_visible and (not candidates or llm_err):
+        detail = (f"chooser visible but discovery failed "
+                  f"(llm_err={llm_err or 'no-candidate-validated'})")
+        print(f"[AI Healer] {detail}; not persisting empty selector.")
+        return DiscoveryResult(DiscoveryStatus.ERROR, detail=detail)
+
+    # 6) No candidates, no chooser, and no LLM call happened — page state
+    #    is just not ready yet. Tell the caller to keep waiting.
+    if not candidates and not llm_called and not discovered:
+        return DiscoveryResult(DiscoveryStatus.NOT_READY,
+                               detail="page still transitioning")
+
+    # 7) Last resort: if we got an unvalidated JS-scan guess, don't persist it
+    #    unless it's the only thing we have AND the chooser is visible.
+    if discovered and chooser_visible:
+        print(f"[AI Healer] Persisting unvalidated JS-scan selector "
+              f"'{discovered}' (chooser visible).")
         _persist(discovered)
-        return discovered
+        return DiscoveryResult(DiscoveryStatus.FOUND, discovered)
 
-    if candidates:
-        print(f"[AI Healer] No candidate fully validated; persisting first guess '{candidates[0]}'.")
-        _persist(candidates[0])
-        return candidates[0]
+    if llm_err:
+        return DiscoveryResult(DiscoveryStatus.ERROR, detail=llm_err)
 
-    _persist("")
-    return ""
+    return DiscoveryResult(DiscoveryStatus.ERROR,
+                           detail="no validated candidate")
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter LLM callers — with bounded retry/backoff and explicit error type
+# ---------------------------------------------------------------------------
+
+class DiscoveryError(RuntimeError):
+    """The LLM transport failed or returned an unparsable response.
+
+    Distinct from a successful empty `[]` answer, which means the model
+    believes there is nothing appropriate to click.
+    """
+
+
+def _post_with_retry(payload: dict, headers: dict, label: str) -> dict:
+    """POST to OpenRouter with bounded retry on transient errors.
+
+    Retries on HTTP 429 and 5xx, plus connection/timeout errors. Treats
+    non-transient HTTP failures (400/401/403/404) as immediate DiscoveryError.
+    Returns parsed JSON; raises DiscoveryError otherwise.
+    """
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    last_err: Optional[Exception] = None
+    for attempt in range(1, OPENROUTER_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+        except requests.exceptions.Timeout as e:
+            last_err = e
+            print(f"[AI Healer] {label}: timeout (attempt {attempt}/"
+                  f"{OPENROUTER_MAX_ATTEMPTS})")
+        except requests.exceptions.ConnectionError as e:
+            last_err = e
+            print(f"[AI Healer] {label}: connection error (attempt {attempt}/"
+                  f"{OPENROUTER_MAX_ATTEMPTS})")
+        else:
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                last_err = requests.exceptions.HTTPError(
+                    f"{response.status_code} {response.text[:120]}"
+                )
+                print(f"[AI Healer] {label}: transient HTTP "
+                      f"{response.status_code} (attempt {attempt}/"
+                      f"{OPENROUTER_MAX_ATTEMPTS})")
+            elif response.status_code >= 400:
+                # Non-transient — don't retry.
+                raise DiscoveryError(
+                    f"{label} HTTP {response.status_code}: {response.text[:200]}"
+                )
+            else:
+                try:
+                    return response.json()
+                except Exception as e:
+                    raise DiscoveryError(f"{label} returned non-JSON response: {e}")
+
+        if attempt < OPENROUTER_MAX_ATTEMPTS:
+            # Exponential backoff with a small jitter.
+            delay = OPENROUTER_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            time.sleep(delay)
+
+    raise DiscoveryError(
+        f"{label} failed after {OPENROUTER_MAX_ATTEMPTS} attempts: {last_err}"
+    )
 
 
 def ask_openrouter_candidates(dom_context: str, step_name: str, failed_selector: str,
-                              page_url: str = ""):
+                              page_url: str = "") -> List[str]:
     if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY environment variable is missing.")
+        raise DiscoveryError("OPENROUTER_API_KEY environment variable is missing.")
 
     prompt = f"""You are an expert browser automation engineer repairing a broken CSS selector.
 
@@ -462,12 +687,11 @@ Rules:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
     }
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30
-    )
-    response.raise_for_status()
-    result = response.json()
-    content = result["choices"][0]["message"]["content"]
+    data = _post_with_retry(payload, headers, label="repair-selector")
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise DiscoveryError(f"unexpected OpenRouter response shape: {e}")
     cands = _parse_candidates(content)
     if not cands:
         print(f"[AI Healer] Raw LLM response (no parsable selectors): {content[:300]}")
@@ -482,19 +706,17 @@ Rules:
 
 def ask_openrouter_candidates_text(dom_context: str, intent: str, text: str,
                                    match_type: str, tag_hint: str,
-                                   page_url: str = ""):
+                                   page_url: str = "") -> List[str]:
     """
     LLM variant for click_text steps. Asks the model for CSS selectors that
-    would identify the element currently matching the user's intent. The
-    model is allowed to interpret semantic intent flexibly — the visible
-    text may be phrased differently than the literal target, and the page
-    may already have auto-advanced past the chooser (in which case the
-    correct answer is an empty array).
+    would identify the element currently matching the user's intent.
 
     Returns a list of CSS selectors. An empty list means "nothing to click".
+    Raises DiscoveryError on transport / non-transient HTTP failure or
+    unparsable response — distinct from a successful empty answer.
     """
     if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY environment variable is missing.")
+        raise DiscoveryError("OPENROUTER_API_KEY environment variable is missing.")
 
     target_line = (
         f'Hint text: "{text}"  (match: {match_type}, tag: {tag_hint or "any"})\n'
@@ -537,29 +759,31 @@ CRITICAL rules:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
     }
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30
-    )
-    response.raise_for_status()
-    result = response.json()
-    content = result["choices"][0]["message"]["content"]
+    data = _post_with_retry(payload, headers, label="repair-text-target")
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise DiscoveryError(f"unexpected OpenRouter response shape: {e}")
     parsed = _parse_candidates(content)
     if not parsed:
         print(f"[AI Healer] Raw LLM response (no parsable selectors): {content[:400]}")
     return parsed
 
 
-async def heal_and_update_config(page, config_path: str, failed_step_index: int,
-                                 action_hint: str | None = None) -> str:
-    """
-    Returns the best VALIDATED selector. Tries deterministic candidates first,
-    then LLM candidates, validating each against the live DOM. Only persists
-    a selector that actually exists, so config.json never gets a hallucinated
-    value. Falls back to the LLM's first guess (unvalidated) so the caller can
-    still attempt text-based recovery.
+# ---------------------------------------------------------------------------
+# Healing — invoked by the runner's retry loop
+# ---------------------------------------------------------------------------
 
-    action_hint="click_text" routes through the text-targeted path; otherwise
-    the original selector-based path is used.
+async def heal_and_update_config(page, config_path: str, failed_step_index: int,
+                                 action_hint: Optional[str] = None) -> str:
+    """
+    Returns the best VALIDATED selector for the failing step, or "" if no
+    candidate could be validated. action_hint="click_text" routes through the
+    text-targeted path; otherwise the original selector-based path is used.
+
+    The caller is expected to also inspect live browser state — returning ""
+    here does NOT necessarily mean there is nothing to click; it just means
+    this helper could not validate a selector against the current DOM.
     """
     with open(config_path, "r") as f:
         config = json.load(f)
@@ -568,37 +792,17 @@ async def heal_and_update_config(page, config_path: str, failed_step_index: int,
     step_name = step["step_name"]
     failed_selector = step.get("selector", "")
 
+    def _persist(sel):
+        step["selector"] = sel
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+
     # Text-targeted path: re-discover by text and validate.
     if action_hint == "click_text" or step.get("action") == "click_text":
         text = step.get("text", "")
         match_type = step.get("match_type", "contains")
         tag_hint = step.get("tag_hint", "")
         intent = step.get("intent", step_name)
-
-        def _persist(sel):
-            step["selector"] = sel
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=2)
-
-        async def _validate(sel: str) -> bool:
-            if not sel or not await selector_exists(page, sel):
-                return False
-            try:
-                count_js = "() => document.querySelectorAll(" + json.dumps(sel) + ").length"
-                n = await page.evaluate(count_js, return_by_value=True)
-                if isinstance(n, dict) and "value" in n:
-                    n = n["value"]
-                if isinstance(n, (int, float)) and n != 1:
-                    return False
-            except Exception:
-                pass
-            if not text:
-                return True
-            elem_text = await get_element_text(page, sel)
-            norm = lambda s: (s or "").replace("\s+", " ").strip().lower()
-            if match_type == "exact":
-                return norm(elem_text) == norm(text)
-            return norm(text) in norm(elem_text)
 
         url = await get_page_url(page)
         print(f"\n[AI Healer] Text-targeted repair for '{step_name}' "
@@ -609,23 +813,28 @@ async def heal_and_update_config(page, config_path: str, failed_step_index: int,
 
         # 1) JS scanner first (cheap path).
         discovered = await find_selector_by_text(page, text, match_type, tag_hint)
-        if discovered and await _validate(discovered):
-            print(f"[AI Healer] Repaired selector: '{failed_selector}' -> '{discovered}' (validated)")
+        if discovered and await _validate_selector_against_target(
+                page, discovered, text, match_type):
+            print(f"[AI Healer] Repaired selector: '{failed_selector}' -> "
+                  f"'{discovered}' (validated)")
             _persist(discovered)
             return discovered
 
-        # 2) LLM with full DOM + URL + intent.
-        candidates = []
+        # 2) LLM with full DOM + URL + intent. Error vs empty are distinct.
+        candidates: List[str] = []
         try:
             dom = await extract_interactive_dom(page)
-            candidates = ask_openrouter_candidates_text(dom, intent, text, match_type, tag_hint, url)
-        except Exception as e:
+            candidates = ask_openrouter_candidates_text(
+                dom, intent, text, match_type, tag_hint, url)
+        except DiscoveryError as e:
             print(f"[AI Healer] LLM text-candidate call failed: {e}")
+            candidates = []
 
         print(f"[AI Healer] LLM text-candidates: {candidates}")
         for cand in candidates:
-            if await _validate(cand):
-                print(f"[AI Healer] Repaired selector: '{failed_selector}' -> '{cand}' (validated)")
+            if await _validate_selector_against_target(page, cand, text, match_type):
+                print(f"[AI Healer] Repaired selector: '{failed_selector}' -> "
+                      f"'{cand}' (validated)")
                 _persist(cand)
                 return cand
 
@@ -638,24 +847,15 @@ async def heal_and_update_config(page, config_path: str, failed_step_index: int,
                 elem_tokens = {t for t in elem_text.split() if len(t) > 2}
                 overlap = len(target_tokens & elem_tokens)
                 if target_tokens and overlap / len(target_tokens) >= 0.5:
-                    print(f"[AI Healer] Lenient repair: '{cand}' (text overlap {overlap}/{len(target_tokens)})")
+                    print(f"[AI Healer] Lenient repair: '{cand}' "
+                          f"(text overlap {overlap}/{len(target_tokens)})")
                     _persist(cand)
                     return cand
 
-        # 4) LLM returned [] — nothing clickable, persist empty selector.
-        if not candidates and not discovered:
-            print(f"[AI Healer] LLM returned no candidates — nothing clickable. Persisting empty.")
-            _persist("")
-            return ""
-
-        if discovered:
-            _persist(discovered)
-            return discovered
-        if candidates:
-            _persist(candidates[0])
-            return candidates[0]
-        _persist("")
-        return ""
+        # 4) Nothing validated — preserve any stored selector rather than
+        #    blanking it out due to a transient condition. The caller will
+        #    decide what to do based on live state.
+        return failed_selector or ""
 
     # Selector-based path (original behaviour).
     print(f"\n[AI Healer] Initiating diagnostic with {MODEL_NAME} for step '{step_name}'...")
@@ -673,26 +873,28 @@ async def heal_and_update_config(page, config_path: str, failed_step_index: int,
     # 2) LLM repair with ranked candidates
     try:
         candidates = ask_openrouter_candidates(dom_context, step_name, failed_selector)
-    except Exception as e:
+    except DiscoveryError as e:
         print(f"[AI Healer] LLM call failed: {e}")
         candidates = []
 
     print(f"[AI Healer] Candidates: {candidates}")
     for cand in candidates:
         if await selector_exists(page, cand):
-            print(f"[AI Healer] Repaired selector: '{failed_selector}' -> '{cand}' (validated)")
+            print(f"[AI Healer] Repaired selector: '{failed_selector}' -> "
+                  f"'{cand}' (validated)")
             config["flow_steps"][failed_step_index]["selector"] = cand
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=2)
             return cand
 
-    # 3) Nothing validated — persist nothing, return best guess for text-fallback path
+    # 3) Nothing validated — return what we had so the caller can decide.
     if candidates:
-        print(f"[AI Healer] WARNING: no candidate validated live; trying '{candidates[0]}' + text fallback.")
+        print(f"[AI Healer] WARNING: no candidate validated live; "
+              f"returning first guess '{candidates[0]}'.")
         return candidates[0]
 
-    print("[AI Healer] No candidates produced; caller will try text fallback.")
-    return failed_selector
+    print("[AI Healer] No candidates produced; caller will decide what to do.")
+    return failed_selector or ""
 
 
 # Backwards-compat alias (old runner imported this name)
@@ -700,13 +902,17 @@ async def heal_selector(page, config_path: str, failed_step_index: int) -> str:
     return await heal_and_update_config(page, config_path, failed_step_index)
 
 
+# ---------------------------------------------------------------------------
+# Generic selector-based discovery (used for non-2FA steps)
+# ---------------------------------------------------------------------------
+
 def discover_selector(dom_context: str, intent: str) -> str:
     """
     Queries the LLM to locate the single best CSS selector matching a high-level
     semantic intent. Used on first run when config.json has empty selectors.
     """
     if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY is not set.")
+        raise DiscoveryError("OPENROUTER_API_KEY is not set.")
 
     prompt = f"""You are an expert browser automation engine.
 Your goal is to inspect the current page's interactive elements and find the single best CSS selector matching this intent:
@@ -736,9 +942,11 @@ Rules:
         "temperature": 0.0
     }
 
-    resp = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=25)
-    resp.raise_for_status()
-    res = resp.json()["choices"][0]["message"]["content"].strip().replace("`", "").strip()
+    data = _post_with_retry(payload, headers, label="discover-selector")
+    try:
+        res = data["choices"][0]["message"]["content"].strip().replace("`", "").strip()
+    except (KeyError, IndexError, TypeError) as e:
+        raise DiscoveryError(f"unexpected OpenRouter response shape: {e}")
     return res.split("\n")[0].strip('"').strip("'")
 
 
@@ -764,3 +972,23 @@ async def populate_and_save_selector(page, config_path: str, step_index: int) ->
         json.dump(config, f, indent=2)
 
     return new_selector
+
+
+__all__ = [
+    "DiscoveryError",
+    "DiscoveryStatus",
+    "DiscoveryResult",
+    "build_deterministic_candidates",
+    "discover_selector",
+    "extract_interactive_dom",
+    "find_selector_by_text",
+    "get_element_text",
+    "get_page_url",
+    "heal_and_update_config",
+    "heal_selector",
+    "is_chooser_visible",
+    "populate_and_save_selector",
+    "populate_and_save_text_target",
+    "scroll_through_page",
+    "selector_exists",
+]

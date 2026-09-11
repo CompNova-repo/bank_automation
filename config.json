@@ -7,7 +7,43 @@
     "enabled": true,
     "method": "google_prompt",
     "approval_timeout_seconds": 60,
-    "poll_interval_seconds": 2
+    "poll_interval_seconds": 2,
+    "transition_grace_seconds": 8,
+    "active_challenge_timeout_seconds": 15,
+    "state_provider": {
+      "authenticated_url_markers": [
+        "myaccount.google.com",
+        "mail.google.com",
+        "oauth",
+        "google.com/u/",
+        "accounts.google.com/b/"
+      ],
+      "challenge_url_markers": [
+        "signin/v2/challenge",
+        "v3/signin/challenge"
+      ],
+      "chooser_url_markers": [
+        "challenge/selection"
+      ],
+      "error_url_markers": [
+        "accounts.google.com/v3/signin/rejected"
+      ],
+      "prompt_sent_indicators": [
+        "tap yes",
+        "tapping",
+        "approve",
+        "tried to sign in",
+        "did you just sign in",
+        "notification on your",
+        "check your phone",
+        "we sent a notification"
+      ],
+      "error_indicators": [
+        "couldn't sign you in",
+        "wrong password",
+        "this browser or app may not be secure"
+      ]
+    }
   },
   "flow_steps": [
     {
@@ -30,7 +66,7 @@
     },
     {
       "step_name": "enter_password",
-      "intent": "The password input field where the user enters their password",
+      "intent": "The password input field where the user enters the password",
       "action": "type",
       "selector": "input[type=\"password\"]",
       "value_env": "TEST_GMAIL_PASS"
@@ -39,7 +75,7 @@
       "step_name": "click_next_password",
       "intent": "The primary Next or Sign in button after entering the password",
       "action": "click",
-      "selector": "#passwordNext"
+      "selector": "[jsname='V67aGc']"
     },
     {
       "step_name": "select_2fa_method",
@@ -55,12 +91,6 @@
         "myaccount.google.com",
         "mail.google.com",
         "oauth"
-      ],
-      "not_contains": [
-        "signin/v2/challenge",
-        "signin/v2/identifier",
-        "v3/signin/challenge",
-        "challenge/selection"
       ],
       "timeout_seconds": 60
     }
