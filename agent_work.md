@@ -260,3 +260,100 @@ if __name__ == "__main__":
 
 
 4. **On Website Change (Healing Mode):** If a bank redesign breaks a stored selector, the exception handler triggers `populate_and_save_selector` to repair it dynamically.
+
+---
+
+## 2FA Handling (Google Prompt & others)
+
+For accounts protected by 2-Step Verification, the runner waits at the
+challenge screen and asks the configured method to confirm the sign-in. Two
+new step actions and a top-level config block make this self-healing in the
+same way as the login flow.
+
+### Config block
+
+```json
+"2fa_settings": {
+  "enabled": true,
+  "method": "google_prompt",
+  "approval_timeout_seconds": 60,
+  "poll_interval_seconds": 2
+}
+```
+
+`method` is resolved by `runner.py` to a visible label Google renders on the
+method chooser via `METHOD_TEXT_MAP`. Override at runtime with the env var
+`GMAIL_2FA_METHOD=google_prompt|sms|voice|totp|security_key`.
+
+### New step actions
+
+| Action                | Purpose                                              | Key fields                                                                 |
+| --------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------- |
+| `click_text`          | Click an element identified by its visible text      | `text`, `match_type` (`exact`/`contains`), `tag_hint`, `selector` (cached) |
+| `wait_for_url_change` | Block until the URL advances past the 2FA challenge  | `contains`, `not_contains`, `timeout_seconds`                              |
+
+### Self-healing pipeline for 2FA
+
+1. **First run** — `selector` is empty. `populate_and_save_text_target`
+   scans the DOM via `find_selector_by_text` (a small JS that prefers
+   `#id` / `data-*` attrs and falls back to a `:nth-of-type` path). The
+   best CSS selector is persisted into `config.json`.
+2. **Subsequent runs** — the stored selector is used directly, no LLM call.
+3. **Google redesign** — the selector stops matching. The runner's retry
+   loop calls `heal_and_update_config(action_hint="click_text")`, which
+   tries:
+     a. The text-finder JS again (catches selector staleness cheaply).
+     b. Deterministic candidates like `li[data-challengetype="13"]`
+        (Google Prompt's stable internal id).
+     c. The LLM via `ask_openrouter_candidates_text`, asking for selectors
+        that locate the element currently containing the target text.
+   The first candidate that validates live (`selector_exists`) is persisted.
+4. **No-method-chooser screen** — Google sometimes shows the prompt
+   directly without a chooser. Set `"optional": true` on
+   `select_2fa_method` and the runner no-ops instead of failing when the
+   text isn't found.
+
+### Example — Google Prompt 2FA step
+
+```json
+{
+  "step_name": "select_2fa_method",
+  "intent": "The 2FA method chooser item representing 'Google Prompt' — receive a fast pop-up notification on a signed-in phone to tap 'Yes, it's me'",
+  "action": "click_text",
+  "text": "Google Prompt",
+  "match_type": "contains",
+  "tag_hint": "li",
+  "selector": "",
+  "optional": true
+},
+{
+  "step_name": "wait_for_2fa_approval",
+  "action": "wait_for_url_change",
+  "contains": ["myaccount.google.com", "mail.google.com"],
+  "not_contains": ["signin/v2/challenge", "signin/v2/identifier"],
+  "timeout_seconds": 60
+}
+```
+
+### Adding a different 2FA method
+
+1. Add an entry to `METHOD_TEXT_MAP` in `runner.py` mapping the config
+   method name to the label Google renders (`"sms": "Text message"`,
+   `"totp": "Authenticator app"`, …).
+2. If the method requires entering a code, follow `select_2fa_method`
+   with the existing `type` action pointing at the code input.
+3. No code changes are required for any method whose chooser entry is a
+   clickable element with visible text.
+
+---
+
+### How This Works in Practice
+
+1. **You provide an empty JSON** containing only intent descriptions (`"intent": "The input field where username is entered"`).
+2. **On Run 1 (Discovery Mode):** The runner sees `""`, inspects the bank's live DOM, queries the AI for the precise selector, fills in `"selector": "#real-bank-user-id"`, saves the file, and executes the step.
+
+
+3. **On Run 2+ (Deterministic Mode):** The runner reads the populated `config.json` directly, executing at full speed with **0 tokens and 0 AI overhead**.
+
+
+4. **On Website Change (Healing Mode):** If a bank redesign breaks a stored selector, the exception handler triggers `populate_and_save_selector` to repair it dynamically.

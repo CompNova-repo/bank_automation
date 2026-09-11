@@ -3,6 +3,12 @@
   "login_url": "https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin",
   "download_dir": "C:\\Temp",
   "timeout_seconds": 15,
+  "2fa_settings": {
+    "enabled": true,
+    "method": "google_prompt",
+    "approval_timeout_seconds": 60,
+    "poll_interval_seconds": 2
+  },
   "flow_steps": [
     {
       "step_name": "enter_email",
@@ -34,6 +40,29 @@
       "intent": "The primary Next or Sign in button after entering the password",
       "action": "click",
       "selector": "#passwordNext"
+    },
+    {
+      "step_name": "select_2fa_method",
+      "intent": "On the 2-Step Verification page, click the option matching the user's intent. The user wants to use Google Prompt (a fast push notification to their phone to tap Yes). If the chooser is not visible or the prompt has already been sent automatically, do nothing - the next step will wait for the URL to advance after approval.",
+      "action": "click_text",
+      "selector": "",
+      "optional": true
+    },
+    {
+      "step_name": "wait_for_2fa_approval",
+      "action": "wait_for_url_change",
+      "contains": [
+        "myaccount.google.com",
+        "mail.google.com",
+        "oauth"
+      ],
+      "not_contains": [
+        "signin/v2/challenge",
+        "signin/v2/identifier",
+        "v3/signin/challenge",
+        "challenge/selection"
+      ],
+      "timeout_seconds": 60
     }
   ]
 }
