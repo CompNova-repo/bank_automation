@@ -65,7 +65,9 @@ from runner import (  # noqa: E402
     _get_visible_text,
     handle_select_2fa_step,
     observe_auth_state,
+    reliable_click,
     resolve_2fa_text,
+    resolve_2fa_texts,
     wait_for_post_password_state,
     wait_for_state,
 )
@@ -210,6 +212,17 @@ class StateProviderClassifierTests(unittest.TestCase):
             AuthState.TRANSITIONING,
         )
 
+    def test_password_url_wins_over_false_positive_chooser_probe(self):
+        """Pre-rendered 2FA markup must not turn a no-op submit into CHOOSER."""
+        self.assertEqual(
+            PROVIDER.classify(
+                "https://accounts.google.com/v3/signin/challenge/pwd",
+                "2-Step Verification",
+                chooser=True,
+            ),
+            AuthState.TRANSITIONING,
+        )
+
 
 class Resolve2faTextTests(unittest.TestCase):
     def test_uses_explicit_step_text(self):
@@ -295,6 +308,44 @@ class FakePageProbeTests(unittest.TestCase):
         page = FakePage(url="https://myaccount.google.com/")
         self.assertEqual(run(observe_auth_state(page, PROVIDER)),
                          AuthState.AUTHENTICATED)
+
+
+class ReliableClickTests(unittest.TestCase):
+    def test_verified_click_rejects_no_op(self):
+        page = FakePage(
+            url="https://accounts.google.com/v3/signin/challenge/pwd",
+            selectors={
+                "[jsname='V67aGc']": "Next",
+                'input[type="password"]': "",
+            },
+        )
+        with self.assertRaisesRegex(TimeoutError, "page did not change"):
+            run(reliable_click(
+                page, "[jsname='V67aGc']", timeout=0.01,
+                verify_page_change=True,
+                disappearance_selector='input[type="password"]',
+            ))
+
+    def test_verified_click_accepts_navigation(self):
+        page = FakePage(
+            url="https://accounts.google.com/v3/signin/challenge/pwd",
+            selectors={
+                "#passwordNext": "Next",
+                'input[type="password"]': "",
+            },
+        )
+
+        async def navigate(_selector):
+            page.url = ("https://accounts.google.com/v3/signin/challenge/"
+                        "selection")
+
+        page._click_hook = navigate
+        run(reliable_click(
+            page, "#passwordNext", timeout=0.01,
+            verify_page_change=True,
+            disappearance_selector='input[type="password"]',
+        ))
+        self.assertEqual(page.click_log.get("#passwordNext"), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +952,197 @@ class DeterministicTextFinderTests(unittest.TestCase):
         self.assertEqual(result.status, DiscoveryStatus.FOUND)
         llm.assert_not_called()
         os.unlink(cfg_path)
+
+
+# ---------------------------------------------------------------------------
+# Fallback text strategy + data-challengetype fallback — keeps the flow
+# advancing when Google renders a different visible label than the configured
+# one (and especially when the OpenRouter API key is unavailable).
+# ---------------------------------------------------------------------------
+
+class FallbackTextStrategyTests(unittest.TestCase):
+    """Proves the runner advances past the chooser without ever calling the
+    LLM when ANY of the candidate visible texts (or the configured method's
+    `data-challengetype`) resolves on the live page.
+    """
+
+    FLOW_STEP = _ConfigFixture.FLOW_STEP
+
+    def _make_cfg_path(self) -> str:
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        _ConfigFixture.write(path)
+        return path
+
+    def test_chooser_uses_alternate_text_when_primary_missing(self):
+        """Primary text "Google Prompt" not on the DOM; alternate
+        "Tap Yes on your" is present and visible. Runner must click
+        without ever calling the LLM."""
+        cfg_path = self._make_cfg_path()
+        page = FakePage(
+            url="https://accounts.google.com/v3/signin/challenge/selection",
+            chooser_visible=True,
+            selectors={
+                "li[data-challengetype='13']":
+                    "Tap Yes on your phone or tablet",
+            },
+        )
+        # Patch the LLM — if it gets called the test fails, proving the
+        # deterministic fallback handled it.
+        with patch("runner.populate_and_save_text_target") as disc, \
+                patch("healer.ask_openrouter_candidates_text") as llm, \
+                patch("healer.extract_interactive_dom",
+                      return_value="[]"):
+            ok = run(handle_select_2fa_step(
+                page, self.FLOW_STEP, 0,
+                {"2fa_settings": {"method": "google_prompt",
+                                  "state_provider": {}}},
+                PROVIDER,
+                config_path=cfg_path,
+            ))
+        self.assertTrue(ok)
+        self.assertEqual(
+            page.click_log.get("li[data-challengetype='13']"), 1)
+        # The LLM discovery helper must not have been invoked.
+        disc.assert_not_called()
+        llm.assert_not_called()
+        # Persisted selector + the matching text.
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        self.assertEqual(
+            cfg["flow_steps"][0]["selector"],
+            "li[data-challengetype='13']")
+        self.assertEqual(
+            cfg["flow_steps"][0]["text"], "Tap Yes on your")
+        os.unlink(cfg_path)
+
+    def test_chooser_uses_data_challengetype_when_no_text_matches(self):
+        """No visible text candidate matches at all, but the configured
+        method's `data-challengetype` element is present. Runner must
+        still advance without calling the LLM."""
+        cfg_path = self._make_cfg_path()
+        page = FakePage(
+            url="https://accounts.google.com/v3/signin/challenge/selection",
+            chooser_visible=True,
+            selectors={
+                "li[data-challengetype='13']":
+                    "Some unexpected label Google did not enumerate",
+            },
+        )
+        with patch("runner.populate_and_save_text_target") as disc, \
+                patch("healer.ask_openrouter_candidates_text") as llm, \
+                patch("healer.extract_interactive_dom",
+                      return_value="[]"):
+            ok = run(handle_select_2fa_step(
+                page, self.FLOW_STEP, 0,
+                {"2fa_settings": {"method": "google_prompt",
+                                  "state_provider": {}}},
+                PROVIDER,
+                config_path=cfg_path,
+            ))
+        self.assertTrue(ok)
+        self.assertEqual(
+            page.click_log.get("li[data-challengetype='13']"), 1)
+        disc.assert_not_called()
+        llm.assert_not_called()
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        self.assertEqual(
+            cfg["flow_steps"][0]["selector"],
+            "[data-challengetype=\"13\"]")
+        os.unlink(cfg_path)
+
+    def test_chooser_does_not_call_llm_with_alternate_text_match(self):
+        """Direct pipeline test: when the chooser is visible and an
+        alternate text candidate matches, `populate_and_save_text_target`
+        itself does not need to fall back to the LLM."""
+        cfg_path = self._make_cfg_path()
+        page = FakePage(
+            url="https://accounts.google.com/v3/signin/challenge/selection",
+            chooser_visible=True,
+            selectors={
+                "li[data-challengetype='13']":
+                    "Get a Google prompt",
+            },
+        )
+        with patch("healer.ask_openrouter_candidates_text") as llm, \
+                patch("healer.extract_interactive_dom",
+                      return_value="[]"):
+            # Direct call to the deterministic finder with the alternate
+            # text; the LLM helper must never be invoked.
+            result = run(populate_and_save_text_target(
+                page, cfg_path, 0,
+                text="Get a Google prompt", match_type="contains",
+                tag_hint="li",
+            ))
+        self.assertEqual(result.status, DiscoveryStatus.FOUND)
+        self.assertEqual(result.selector, "li[data-challengetype='13']")
+        llm.assert_not_called()
+        os.unlink(cfg_path)
+
+    def test_step_supplied_text_wins_over_method_default(self):
+        """Explicit `text` on the step is treated as the primary
+        candidate; method fallbacks still come after it."""
+        cfg_path = self._make_cfg_path()
+        page = FakePage(
+            url="https://accounts.google.com/v3/signin/challenge/selection",
+            chooser_visible=True,
+            selectors={
+                "li[data-challengetype='13']":
+                    "Tap Yes on your phone or tablet",
+            },
+        )
+        step = {**self.FLOW_STEP, "text": "Tap Yes on your"}
+        with patch("runner.populate_and_save_text_target") as disc, \
+                patch("healer.ask_openrouter_candidates_text") as llm, \
+                patch("healer.extract_interactive_dom",
+                      return_value="[]"):
+            ok = run(handle_select_2fa_step(
+                page, step, 0,
+                {"2fa_settings": {"method": "google_prompt",
+                                  "state_provider": {}}},
+                PROVIDER,
+                config_path=cfg_path,
+            ))
+        self.assertTrue(ok)
+        self.assertEqual(
+            page.click_log.get("li[data-challengetype='13']"), 1)
+        disc.assert_not_called()
+        llm.assert_not_called()
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["flow_steps"][0]["text"], "Tap Yes on your")
+        os.unlink(cfg_path)
+
+
+class Resolve2faTextsTests(unittest.TestCase):
+    """Order and de-duplication semantics for resolve_2fa_texts."""
+
+    def test_uses_method_fallbacks_when_no_step_text(self):
+        step = {}
+        cfg = {"2fa_settings": {"method": "google_prompt"}}
+        out = resolve_2fa_texts(step, cfg)
+        # Primary is the first METHOD_TEXT_MAP entry for google_prompt.
+        self.assertEqual(out[0], "Google Prompt")
+        # No duplicates.
+        self.assertEqual(len(out), len(set(out)))
+        # Subsequent entries are alternates (e.g. "Tap Yes on your").
+        self.assertIn("Tap Yes on your", out)
+
+    def test_explicit_text_is_primary(self):
+        step = {"text": "Custom text"}
+        cfg = {"2fa_settings": {"method": "google_prompt"}}
+        out = resolve_2fa_texts(step, cfg)
+        self.assertEqual(out[0], "Custom text")
+        self.assertIn("Google Prompt", out)
+        # No duplicates.
+        self.assertEqual(len(out), len(set(out)))
+
+    def test_unknown_method_falls_back_to_method_name(self):
+        step = {}
+        cfg = {"2fa_settings": {"method": "fingerprint"}}
+        out = resolve_2fa_texts(step, cfg)
+        self.assertEqual(out, ["fingerprint"])
 
 
 if __name__ == "__main__":

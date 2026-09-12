@@ -78,7 +78,7 @@
       "step_name": "click_next_password",
       "intent": "The primary Next or Sign in button after entering the password",
       "action": "click",
-      "selector": "[jsname='V67aGc']"
+      "selector": "#passwordNext"
     },
     {
       "step_name": "select_2fa_method",

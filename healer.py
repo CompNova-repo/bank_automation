@@ -35,6 +35,7 @@ regression.
 """
 
 import os
+import asyncio
 import json
 import re
 import time
@@ -47,7 +48,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL_NAME = os.environ.get("HEALER_MODEL", "qwen/qwen3.7-flash")
 
 # Bounded retry/backoff for transient OpenRouter failures (429 / 5xx /
@@ -127,19 +128,22 @@ async def extract_interactive_dom(page, limit: int = 200):
             });
         }
         out.sort((a, b) => (b.visible - a.visible));
-        return out.filter(item =>
+        return JSON.stringify(out.filter(item =>
             item.visible && (
                 item.id || item.parentId || item.innerText ||
                 Object.keys(item.attrs).length > 0
             )
-        ).slice(0, LIMIT);
+        ).slice(0, LIMIT));
     }
     """.replace("LIMIT", str(limit))
     try:
-        elements_data = await page.evaluate(js_extract, return_by_value=True)
-        # nodriver evaluate may return RemoteObject wrapper; normalize
-        if isinstance(elements_data, dict) and "value" in elements_data:
-            elements_data = elements_data["value"]
+        raw = await page.evaluate(js_extract, return_by_value=True)
+        elements_data = _unwrap_evaluate_result(raw)
+        if isinstance(elements_data, str):
+            try:
+                elements_data = json.loads(elements_data)
+            except Exception:
+                elements_data = []
         if not isinstance(elements_data, list):
             elements_data = []
         return json.dumps(elements_data, indent=2)
@@ -213,10 +217,20 @@ def _build_text_finder_js(text: str, match_type: str, tag_hint: str) -> str:
     """JS that scans the DOM for a visible element whose text contains `text`.
 
     Returns a unique CSS selector for the best match, or null. Strategy:
-    scan multiple tag types (li, div, span, button, a, role=button, etc.),
-    pick the most specific match (shortest innerText containing the target),
-    build a selector preferring #id / unique data-* / aria-* attrs, falling
-    back to a :nth-of-type path. No hardcoded domain knowledge.
+    scan broadly (li, div, span, button, a, role=button, role=listitem, plus
+    anything with the target text), pick the most specific match (shortest
+    innerText containing the target), build a selector preferring #id /
+    unique data-* / aria-* attrs, falling back to a :nth-of-type path.
+    No hardcoded domain knowledge.
+
+    Also recurses into same-origin iframes (Google renders the 2-Step
+    Verification chooser inside an iframe that JS in the top-level document
+    cannot see by default).
+
+    Visibility is intentionally lenient: an element with a non-zero rect that
+    is not display:none/visibility:hidden counts. Off-screen items inside
+    scrollable containers still register, which is what we want for the
+    2-Step Verification chooser where the third option is below the fold.
     """
     safe_text = json.dumps(text)
     safe_match = json.dumps(match_type or "contains")
@@ -231,43 +245,82 @@ def _build_text_finder_js(text: str, match_type: str, tag_hint: str) -> str:
         if (!target) return null;
         const isVisible = (el) => {
             const r = el.getBoundingClientRect();
-            if (!r || r.width === 0 || r.height === 0) return false;
+            if (!r || (r.width === 0 && r.height === 0)) return false;
             const s = window.getComputedStyle(el);
             return s.visibility !== 'hidden' && s.display !== 'none';
         };
-        // Scan broadly — Google uses li/div for 2FA items, and the tag_hint
-        // is only a preference.
         const tagSet = TAG
             ? [TAG, 'li', 'div', 'span', 'button', 'a', '[role="button"]', '[role="listitem"]']
             : ['li', 'div', 'span', 'button', 'a', '[role="button"]', '[role="listitem"]'];
+        // Find every document we can read — top-level plus same-origin iframes.
+        const documents = [document];
+        try {
+            for (const f of Array.from(document.querySelectorAll('iframe'))) {
+                try {
+                    const d = f.contentDocument;
+                    if (d) documents.push(d);
+                } catch (e) { /* cross-origin — skip */ }
+            }
+        } catch (e) {}
         const seen = new Set();
         let best = null;
         let bestLen = Infinity;
-        for (const sel of tagSet) {
-            const els = Array.from(document.querySelectorAll(sel));
-            for (const el of els) {
-                if (!isVisible(el)) continue;
-                const tx = norm(el.innerText || el.textContent || '');
-                const ok = MATCH === 'exact' ? (tx === target) : (tx.indexOf(target) !== -1);
-                if (!ok) continue;
-                if (tx.length >= bestLen) continue; // prefer smaller, more specific match
-                best = el;
-                bestLen = tx.length;
+        for (const doc of documents) {
+            const w = doc.defaultView || window;
+            for (const sel of tagSet) {
+                let els;
+                try { els = Array.from(doc.querySelectorAll(sel)); }
+                catch (e) { continue; }
+                for (const el of els) {
+                    if (seen.has(el)) continue;
+                    seen.add(el);
+                    let visible = false;
+                    try { visible = isVisible(el); } catch (e) {}
+                    if (!visible) continue;
+                    let tx = '';
+                    try { tx = norm(el.innerText || el.textContent || ''); } catch (e) {}
+                    const ok = MATCH === 'exact' ? (tx === target) : (tx.indexOf(target) !== -1);
+                    if (!ok) continue;
+                    if (tx.length >= bestLen) continue;
+                    best = el;
+                    bestLen = tx.length;
+                }
+            }
+            if (!best) {
+                let all;
+                try { all = Array.from(doc.querySelectorAll('*')); }
+                catch (e) { continue; }
+                for (const el of all) {
+                    if (seen.has(el)) continue;
+                    seen.add(el);
+                    let visible = false;
+                    try { visible = isVisible(el); } catch (e) {}
+                    if (!visible) continue;
+                    let tx = '';
+                    try { tx = norm(el.innerText || el.textContent || ''); } catch (e) {}
+                    if (tx.length >= bestLen) continue;
+                    const ok = MATCH === 'exact' ? (tx === target) : (tx.indexOf(target) !== -1);
+                    if (!ok) continue;
+                    best = el;
+                    bestLen = tx.length;
+                }
             }
         }
         if (!best) return null;
         const el = best;
         if (el.id) return '#' + el.id;
-        // Prefer unique data-* / aria-* / role / name / jsname
         const attrPriority = ['data-challengetype', 'data-id', 'data-testid', 'aria-label', 'role', 'jsname', 'name'];
         for (const an of attrPriority) {
             const v = el.getAttribute && el.getAttribute(an);
             if (v) {
                 const sel = '[' + an + '="' + v.replace(/"/g, '\\\\"') + '"]';
-                try { if (document.querySelectorAll(sel).length === 1) return sel; } catch (e) {}
+                try {
+                    if (el.ownerDocument.querySelectorAll(sel).length === 1) {
+                        return sel;
+                    }
+                } catch (e) {}
             }
         }
-        // Fallback: nth-of-type path
         const parts = [];
         let cur = el;
         while (cur && cur.tagName && parts.length < 6) {
@@ -290,20 +343,165 @@ def _build_text_finder_js(text: str, match_type: str, tag_hint: str) -> str:
 
 
 async def find_selector_by_text(page, text: str, match_type: str = "contains",
-                                tag_hint: str = "li") -> Optional[str]:
-    """Run the text-finder JS and return the CSS selector it picks, or None."""
+                                tag_hint: str = "li",
+                                timeout: float = 6,
+                                poll: float = 0.5) -> Optional[str]:
+    """Run the text-finder JS and return the CSS selector it picks, or None.
+
+    Retries up to `timeout` seconds (with `poll`-second sleeps) so that
+    elements Google renders asynchronously (after the URL settles) still
+    have a chance to enter the DOM before we give up on a text.
+    """
     if not text:
         return None
-    js = _build_text_finder_js(text, match_type, tag_hint)
+    deadline = time.monotonic() + max(float(timeout), 0.5)
+    last = None
+    while time.monotonic() < deadline:
+        js = _build_text_finder_js(text, match_type, tag_hint)
+        try:
+            result = await page.evaluate(js, return_by_value=True)
+            result = _unwrap_evaluate_result(result)
+            if isinstance(result, str) and result.strip():
+                last = result.strip()
+                return last
+        except Exception:
+            pass
+        await page.sleep(poll)
+    return last
+
+
+async def debug_dump_chooser_items(page) -> List[dict]:
+    """Diagnostic helper — return the text + attributes of every element
+    that could possibly be a 2FA chooser item. Useful when the text-finder
+    returns None and we want to see what is actually in the DOM.
+
+    Recurses into same-origin iframes — Google often renders the 2-Step
+    Verification chooser inside one.
+    """
+    js = """
+    () => {
+        const out = [];
+        const seen = new Set();
+        const documents = [document];
+        try {
+            for (const f of Array.from(document.querySelectorAll('iframe'))) {
+                try {
+                    const d = f.contentDocument;
+                    if (d) documents.push(d);
+                } catch (e) {}
+            }
+        } catch (e) {}
+        const sels = ['li', 'div', 'span', 'button', 'a', '[role="button"]', '[role="listitem"]', '[role="option"]', '[data-challengetype]', '[role="menuitem"]', 'h1', 'h2'];
+        for (const doc of documents) {
+            for (const sel of sels) {
+                let els;
+                try { els = Array.from(doc.querySelectorAll(sel)); }
+                catch (e) { continue; }
+                for (const el of els) {
+                    if (seen.has(el)) continue;
+                    seen.add(el);
+                    const r = el.getBoundingClientRect();
+                    if (!r || (r.width === 0 && r.height === 0)) continue;
+                    const txt = (el.innerText || el.textContent || '').trim();
+                    if (txt.length < 3) continue;
+                    out.push({
+                        tag: el.tagName.toLowerCase(),
+                        dt: el.getAttribute && el.getAttribute('data-challengetype'),
+                        role: el.getAttribute && el.getAttribute('role'),
+                        text: txt.slice(0, 120),
+                    });
+                    if (out.length > 80) break;
+                }
+                if (out.length > 80) break;
+            }
+            if (out.length > 80) break;
+        }
+        return JSON.stringify(out);
+    }
+    """
     try:
         result = await page.evaluate(js, return_by_value=True)
-        if isinstance(result, dict) and "value" in result:
-            result = result["value"]
-        if isinstance(result, str) and result.strip():
-            return result.strip()
+        result = _unwrap_evaluate_result(result)
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                return []
+        if isinstance(result, list):
+            return result
     except Exception:
+        pass
+    return []
+
+
+def _unwrap_evaluate_result(result):
+    """Normalise whatever nodriver returned from `page.evaluate` into a
+    plain Python value. Handles:
+      - direct dict / list / str returns
+      - RemoteObject-like dicts with a `value` key
+      - RemoteObject instances exposing a `value` attribute
+    """
+    if result is None:
         return None
-    return None
+    # RemoteObject (or any object with a `.value` attribute)
+    if not isinstance(result, (str, int, float, bool, list, dict, tuple)):
+        # Inspect what we have
+        value_attr = getattr(result, "value", None)
+        type_attr = getattr(result, "type", None)
+        desc_attr = getattr(result, "description", None)
+        if isinstance(value_attr, (str, int, float, bool, list, dict)):
+            return value_attr
+        # If value is None but type says "string", try description
+        if type_attr == "string" and isinstance(desc_attr, str):
+            return desc_attr
+        # Last resort — return a stub dict with the metadata so caller
+        # can see what happened instead of crashing.
+        return {"_raw_type": str(type(result)),
+                "_raw_value": str(value_attr)[:200] if value_attr is not None else None,
+                "_raw_type_attr": type_attr,
+                "_raw_desc": str(desc_attr)[:200] if desc_attr is not None else None}
+    if isinstance(result, dict) and "value" in result and len(result) <= 4:
+        return result["value"]
+    return result
+
+
+async def debug_dump_dom_summary(page) -> dict:
+    """Top-level diagnostic — summarise how many iframes / challenges /
+    headings are present, and return the URL/body snippet of each document.
+    Use this when the text-finder returns nothing AND the chooser is
+    visibly there."""
+    js = """
+    () => {
+        const out = {};
+        try { out.bodyTextLen = (document.body && document.body.innerText) ? document.body.innerText.length : -1; }
+        catch (e) {}
+        try { out.bodyTextSample = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 400) : ''; }
+        catch (e) {}
+        try { out.totalElements = document.querySelectorAll('*').length; }
+        catch (e) {}
+        try { out.dtCount = document.querySelectorAll('[data-challengetype]').length; }
+        catch (e) {}
+        try { out.iframeCount = document.querySelectorAll('iframe').length; }
+        catch (e) {}
+        try { out.title = document.title || ''; }
+        catch (e) {}
+        try { out.htmlLen = document.documentElement.outerHTML.length; }
+        catch (e) {}
+        try { out.htmlSample = document.documentElement.outerHTML.slice(0, 1500); }
+        catch (e) {}
+        return out;
+    }
+    """
+    try:
+        result = await page.evaluate(js, return_by_value=True)
+        result = _unwrap_evaluate_result(result)
+        if isinstance(result, dict):
+            return result
+    except Exception as e:
+        return {"errors": [f"evaluate failed: {e}"]}
+    return {"errors": ["evaluate returned non-dict", "result=" + repr(result)[:300]]}
 
 
 async def get_element_text(page, selector: str) -> str:
@@ -322,8 +520,7 @@ async def get_element_text(page, selector: str) -> str:
     )
     try:
         result = await page.evaluate(js, return_by_value=True)
-        if isinstance(result, dict) and "value" in result:
-            result = result["value"]
+        result = _unwrap_evaluate_result(result)
         return str(result or "")
     except Exception:
         return ""
@@ -339,8 +536,7 @@ async def get_page_url(page) -> str:
         pass
     try:
         result = await page.evaluate("() => location.href", return_by_value=True)
-        if isinstance(result, dict) and "value" in result:
-            result = result["value"]
+        result = _unwrap_evaluate_result(result)
         return str(result or "")
     except Exception:
         return ""
@@ -350,26 +546,38 @@ async def scroll_through_page(page, step_px: int = 400, max_steps: int = 8) -> N
     """
     Scroll the page top-to-bottom in `step_px` increments to force lazy-loaded
     elements (e.g. off-screen 2FA options) into the DOM. Then scroll back to top.
+
+    Also scrolls any inner scrollable container (overflow:auto/scroll) that
+    is taller than its viewport — Google's 2FA chooser renders the option
+    list inside such a container with a "show more" arrow button.
     """
     js = """
     () => new Promise(resolve => {
         try {
-            let y = 0;
-            const step = STEP;
-            const max = MAX;
-            let i = 0;
-            function tick() {
-                window.scrollTo(0, y);
-                y += step;
-                i += 1;
-                if (i < max) {
-                    setTimeout(tick, 80);
-                } else {
-                    window.scrollTo(0, 0);
-                    setTimeout(resolve, 200);
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            const scrollInnerContainers = () => {
+                const containers = document.querySelectorAll('div, ul, ol, section');
+                for (const el of containers) {
+                    try {
+                        const s = window.getComputedStyle(el);
+                        const overflowY = (s.overflowY === 'auto' || s.overflowY === 'scroll');
+                        if (overflowY && el.scrollHeight > el.clientHeight + 4) {
+                            el.scrollTop = el.scrollHeight;
+                        }
+                    } catch (e) {}
                 }
-            }
-            tick();
+            };
+            (async () => {
+                for (let i = 0; i < MAX; i++) {
+                    window.scrollTo(0, i * STEP);
+                    scrollInnerContainers();
+                    await sleep(60);
+                }
+                window.scrollTo(0, 0);
+                scrollInnerContainers();
+                await sleep(200);
+                resolve();
+            })();
         } catch (e) { resolve(); }
     })
     """.replace("STEP", str(step_px)).replace("MAX", str(max_steps))
@@ -386,18 +594,25 @@ async def scroll_through_page(page, step_px: int = 400, max_steps: int = 8) -> N
 
 CHOOSER_PROBE_JS = """
 () => {
+    const isVisible = el => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 &&
+               s.visibility !== 'hidden' && s.display !== 'none' &&
+               s.opacity !== '0' && el.getAttribute('aria-hidden') !== 'true';
+    };
     // Google wraps 2FA method options as <li data-challengetype="..."> elements.
     // The chooser is the only place these appear together in meaningful numbers.
     const items = document.querySelectorAll('[data-challengetype]');
     if (items.length >= 2) {
-        const visible = Array.from(items).filter(el => {
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-        });
+        const visible = Array.from(items).filter(isVisible);
         if (visible.length >= 2) return true;
     }
-    // Fallback: scan for a known chooser heading.
-    const headings = Array.from(document.querySelectorAll('h1, h2, div'))
+    // Fallback: scan actual headings only.  A broad div scan sees text from
+    // hidden/pre-rendered descendants and can misclassify the password page.
+    const headings = Array.from(document.querySelectorAll(
+        'h1, h2, [role="heading"]'
+    )).filter(isVisible)
         .map(el => (el.innerText || '').trim().toLowerCase());
     if (headings.some(t => t.indexOf('2-step verification') !== -1 ||
                            t.indexOf('choose how') !== -1 ||
@@ -414,8 +629,7 @@ async def is_chooser_visible(page) -> bool:
     """Return True if the 2FA method chooser is on screen right now."""
     try:
         result = await page.evaluate(CHOOSER_PROBE_JS, return_by_value=True)
-        if isinstance(result, dict) and "value" in result:
-            result = result["value"]
+        result = _unwrap_evaluate_result(result)
         return bool(result)
     except Exception:
         return False
@@ -437,8 +651,7 @@ async def _validate_selector_against_target(page, selector: str, text: str,
     try:
         count_js = "() => document.querySelectorAll(" + json.dumps(selector) + ").length"
         n = await page.evaluate(count_js, return_by_value=True)
-        if isinstance(n, dict) and "value" in n:
-            n = n["value"]
+        n = _unwrap_evaluate_result(n)
         if isinstance(n, (int, float)) and n != 1:
             return False
     except Exception:
@@ -766,7 +979,13 @@ CRITICAL rules:
         raise DiscoveryError(f"unexpected OpenRouter response shape: {e}")
     parsed = _parse_candidates(content)
     if not parsed:
-        print(f"[AI Healer] Raw LLM response (no parsable selectors): {content[:400]}")
+        normalized = (content or "").strip().replace("`", "").strip()
+        if normalized == "[]":
+            print("[AI Healer] OpenRouter request succeeded; model returned "
+                  "an empty candidate list [].")
+        else:
+            print(f"[AI Healer] Raw LLM response (no parsable selectors): "
+                  f"{content[:400]}")
     return parsed
 
 

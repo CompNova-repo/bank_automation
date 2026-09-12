@@ -32,12 +32,14 @@ from healer import (
     DiscoveryError,
     DiscoveryResult,
     DiscoveryStatus,
+    debug_dump_chooser_items,
     find_selector_by_text,
     get_page_url,
     heal_and_update_config,
     is_chooser_visible,
     populate_and_save_selector,
     populate_and_save_text_target,
+    scroll_through_page,
 )
 
 load_dotenv()
@@ -45,14 +47,54 @@ load_dotenv()
 USER_DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "C:\\Temp"), "Test_RPA_Profile")
 CONFIG_PATH = "config.json"
 
-# Map a semantic 2FA method name -> the visible label Google renders on the
-# 2FA method chooser page. Used when a step doesn't carry its own `text`.
+# Map a semantic 2FA method name -> ordered list of visible labels Google
+# may render on the 2FA method chooser page (primary first). The runner
+# tries each label with the deterministic JS finder before falling back
+# to the LLM, which keeps the flow working even when the OpenRouter API
+# key is unavailable or returns a different naming on the same chooser.
 METHOD_TEXT_MAP = {
-    "google_prompt": "Google Prompt",
-    "sms": "Text message",
-    "voice": "Phone call",
-    "totp": "Authenticator app",
-    "security_key": "Security key",
+    "google_prompt": [
+        "Google Prompt",
+        "Tap Yes on your",
+        "Get a Google prompt",
+        "Use your phone",
+        "phone or tablet",
+    ],
+    "sms": [
+        "Text message",
+        "Get a code by text",
+        "Get a verification code by text",
+    ],
+    "voice": [
+        "Phone call",
+        "Get a phone call",
+    ],
+    "totp": [
+        "Authenticator app",
+        "Google Authenticator",
+        "Get a verification code",
+    ],
+    "security_key": [
+        "Security key",
+        "Use your Security Key",
+        "Use your security key",
+    ],
+}
+
+# Stable Google internal IDs (`data-challengetype`) for each 2FA method.
+# Used as a last-resort deterministic fallback once text matching fails
+# (e.g. when the chooser renders text we haven't enumerated or when the
+# LLM is unavailable). Reference values observed on Google's signin:
+#   6  = SMS
+#   9  = TOTP / Authenticator
+#   12 = Security key
+#   13 = Google Prompt
+METHOD_CHALLENGETYPE_MAP = {
+    "google_prompt": "13",
+    "sms": "6",
+    "voice": "6",
+    "totp": "9",
+    "security_key": "12",
 }
 
 # Fallback order when the preferred tag yields nothing. Picked to match
@@ -130,6 +172,8 @@ class StateProvider:
     def classify(self, url: str, page_text: str, chooser: bool) -> AuthState:
         u = (url or "").lower()
         text = (page_text or "").lower()
+        on_password_challenge = any(
+            m in u for m in self.password_challenge_markers)
         if any(m in u for m in self.authenticated_url_markers):
             # Don't fire AUTHENTICATED just because an oauth callback
             # *contains* myaccount — but if we got past challenge/selection
@@ -138,7 +182,11 @@ class StateProvider:
                 return AuthState.AUTHENTICATED
         if any(m in u for m in self.error_url_markers):
             return AuthState.ERROR
-        if chooser:
+        # A loose DOM probe can see pre-rendered/hidden 2FA markup while the
+        # password challenge is still active.  Do not let that override the
+        # much stronger URL signal.  Prompt/error text remains authoritative
+        # below because Google can update the page before changing its URL.
+        if chooser and not on_password_challenge:
             return AuthState.CHOOSER
         if any(t in text for t in self.prompt_sent_indicators):
             return AuthState.PROMPT_SENT
@@ -151,7 +199,7 @@ class StateProvider:
             return AuthState.CHOOSER
         # Check for password challenge URLs - these indicate we're still
         # on the password step, not yet at 2FA stage.
-        if any(m in u for m in self.password_challenge_markers):
+        if on_password_challenge:
             return AuthState.TRANSITIONING
         # Check for other challenge types that indicate an active 2FA challenge
         # (TOTP, security key, etc.) but NOT password challenges.
@@ -177,17 +225,39 @@ def resolve_2fa_method(config: dict) -> str:
 
 
 def resolve_2fa_text(step: dict, config: dict) -> str:
-    """Decide which visible text to click for a click_text step.
+    """The primary visible text to click for a click_text step.
 
     Priority:
       1. step["text"] if present.
-      2. METHOD_TEXT_MAP[2fa_settings.method] mapped to a Google-style label.
+      2. First item of METHOD_TEXT_MAP[2fa_settings.method].
       3. The configured method name as a last resort.
     """
-    if step.get("text"):
-        return step["text"]
+    texts = resolve_2fa_texts(step, config)
+    return texts[0] if texts else ""
+
+
+def resolve_2fa_texts(step: dict, config: dict) -> List[str]:
+    """All candidate visible texts for the configured 2FA method, primary first.
+
+    The runner feeds these to the deterministic JS finder one at a time
+    so it can keep advancing even if Google changes the rendered label
+    for the same method (e.g. "Google Prompt" → "Tap Yes on your phone").
+    """
+    explicit = (step.get("text") or "").strip()
     method = resolve_2fa_method(config)
-    return METHOD_TEXT_MAP.get(method, method or step.get("text", ""))
+    fallbacks = list(METHOD_TEXT_MAP.get(method) or [])
+    if explicit:
+        ordered = [explicit] + [t for t in fallbacks if t != explicit]
+    elif fallbacks:
+        ordered = list(fallbacks)
+    else:
+        ordered = [method] if method else []
+    seen, out = set(), []
+    for t in ordered:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -214,16 +284,49 @@ async def reliable_type(page, selector: str, text: str, timeout: float = 8):
     await page.sleep(0.5)
 
 
-async def reliable_click(page, selector: str, timeout: float = 8):
+async def reliable_click(page, selector: str, timeout: float = 8,
+                         verify_page_change: bool = False,
+                         disappearance_selector: str = ""):
     """
-    Scrolls to and clicks the target element.
+    Click the target element and optionally verify that the click had an
+    observable effect.
+
+    nodriver considers a click successful when it dispatches the input event;
+    that does not prove a nested label/span actually submitted its form.  For
+    navigation buttons, verification succeeds when either the URL changes or
+    a page-specific element (for example the password input) disappears.
     """
+    before_url = await get_page_url(page) if verify_page_change else ""
     el = await page.select(selector, timeout=timeout)
     if not el:
         raise TimeoutError(f"Button element '{selector}' not found.")
 
     await el.click()
-    await page.sleep(1.5)
+    if not verify_page_change:
+        await page.sleep(1.5)
+        return
+
+    verify_timeout = min(max(float(timeout), 1.0), 8.0)
+    deadline = asyncio.get_event_loop().time() + verify_timeout
+    while asyncio.get_event_loop().time() < deadline:
+        current_url = await get_page_url(page)
+        if before_url and current_url and current_url != before_url:
+            await page.sleep(0.5)
+            return
+        if disappearance_selector:
+            try:
+                if await page.query_selector(disappearance_selector) is None:
+                    await page.sleep(0.5)
+                    return
+            except Exception:
+                # URL verification can still succeed on the next poll.
+                pass
+        await page.sleep(0.25)
+
+    raise TimeoutError(
+        f"Click on '{selector}' was dispatched, but the page did not change "
+        f"within {verify_timeout:g}s."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -456,14 +559,29 @@ async def handle_select_2fa_step(page, step: dict, idx: int, config: dict,
 async def _select_from_chooser(page, step: dict, idx: int, config: dict,
                                provider: StateProvider, optional: bool,
                                config_path: str = CONFIG_PATH) -> bool:
-    """Chooser IS present. Discover and click the configured method."""
+    """Chooser IS present. Discover and click the configured method.
+
+    Tries, in order:
+      1. Stored selector (cheap; no LLM).
+      2. Deterministic JS scanner for each candidate text + tag combo.
+         This is the primary path — it works without the LLM and survives
+         Google's labelling changes for the same method.
+      3. `data-challengetype` attribute fallback — stable Google internal
+         id per 2FA method. Used when text matching misses.
+      4. LLM-backed discovery (`populate_and_save_text_target`).
+      5. Error/empty handling per the DiscoveryStatus semantics.
+    """
     intent = step.get("intent", step.get("step_name", ""))
-    text = resolve_2fa_text(step, config)
     match_type = step.get("match_type", "contains")
     tag_hint = step.get("tag_hint", "")
     stored_selector = (step.get("selector") or "").strip()
+    method = resolve_2fa_method(config)
+    candidate_texts = resolve_2fa_texts(step, config)
+    primary_text = candidate_texts[0] if candidate_texts else ""
+    challengetype = METHOD_CHALLENGETYPE_MAP.get(method, "")
 
-    print(f"[*] 2FA chooser visible. Preferred method text: '{text}'.")
+    print(f"[*] 2FA chooser visible. Method: {method}. "
+          f"Candidate texts: {candidate_texts}")
     print(f"[*] Stored selector: '{stored_selector or '(none)'}'.")
 
     # 1) Try stored selector first (cheap; no LLM).
@@ -480,11 +598,101 @@ async def _select_from_chooser(page, step: dict, idx: int, config: dict,
         except Exception as e:
             print(f"[!] Stored selector '{stored_selector}' failed: {e}")
 
-    # 2) Discovery — propagates resolved text/match_type/tag_hint.
-    print("[?] Discovering selector for configured 2FA method...")
+    # 2) Deterministic JS scanner for each candidate text × tag. This is
+    #    the primary path — it works without the LLM, survives Google's
+    #    labelling changes for the same method, and persists whichever
+    #    selector first validates against the live DOM.
+    print("[?] Discovering selector for configured 2FA method "
+          "(deterministic first)...")
+    # Force lazy-loaded / off-screen chooser entries into the DOM first.
+    await scroll_through_page(page)
+    tags_to_try: List[str] = []
+    if tag_hint:
+        tags_to_try.append(tag_hint)
+    tags_to_try.extend(t for t in TEXT_TAG_FALLBACK if t != tag_hint)
+
+    for text in candidate_texts:
+        if not text:
+            continue
+        text_matched = False
+        for tag in tags_to_try:
+            try:
+                sel = await find_selector_by_text(
+                    page, text, match_type, tag, timeout=1.5, poll=0.3)
+            except Exception as e:
+                print(f"[!] JS scan raised for text='{text}' tag='{tag}': {e}")
+                continue
+            if not sel:
+                continue
+            text_matched = True
+            try:
+                el = await page.select(sel, timeout=2)
+                if el:
+                    await el.click()
+                    await page.sleep(1.0)
+                    # Persist the validated selector + the matching text so
+                    # the next run reuses the deterministic path.
+                    with open(config_path, "r") as f:
+                        cfg = json.load(f)
+                    if idx < len(cfg.get("flow_steps", [])):
+                        cfg["flow_steps"][idx]["selector"] = sel
+                        cfg["flow_steps"][idx]["text"] = text
+                    with open(config_path, "w") as f:
+                        json.dump(cfg, f, indent=2)
+                    print(f"[+] Clicked 2FA method via JS scan: '{sel}' "
+                          f"(matched text='{text}', tag='{tag}').")
+                    return True
+            except Exception as e:
+                print(f"[!] JS-scan selector '{sel}' for text='{text}' "
+                      f"failed: {e}")
+                continue
+        if not text_matched:
+            print(f"[~] JS scan found nothing for text='{text}'.")
+
+    # If deterministic text-finder did not match anything, dump the
+    # chooser's interactive elements so the next round of fallbacks
+    # (data-challengetype / positional) can be tuned without a re-run.
+    items = await debug_dump_chooser_items(page)
+    if items:
+        print(f"[~] Chooser items visible in the DOM ({len(items)}):")
+        for it in items[:20]:
+            extras = []
+            if it.get("dt"):
+                extras.append(f"dt={it['dt']}")
+            if it.get("role"):
+                extras.append(f"role={it['role']}")
+            extra_s = (" " + " ".join(extras)) if extras else ""
+            print(f"    <{it['tag']}{extra_s}> {it['text']!r}")
+
+    # 3) Last deterministic fallback: data-challengetype attribute.
+    #    Google's signin renders each 2FA option as a <li> with a stable
+    #    `data-challengetype` value (13=Google Prompt, 12=Security key,
+    #    9=TOTP, 6=SMS). Use this only when no text candidate matched —
+    #    it still avoids the LLM entirely.
+    if challengetype:
+        sel = f'[data-challengetype="{challengetype}"]'
+        try:
+            el = await page.select(sel, timeout=2)
+            if el:
+                await el.click()
+                await page.sleep(1.0)
+                with open(config_path, "r") as f:
+                    cfg = json.load(f)
+                if idx < len(cfg.get("flow_steps", [])):
+                    cfg["flow_steps"][idx]["selector"] = sel
+                with open(config_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                print(f"[+] Clicked 2FA method via data-challengetype='"
+                      f"{challengetype}'.")
+                return True
+            print(f"[!] data-challengetype='{challengetype}' did not resolve.")
+        except Exception as e:
+            print(f"[!] data-challengetype selector '{sel}' failed: {e}")
+
+    # 4) Discovery via LLM (may fail if API key invalid).
     discovery: DiscoveryResult = await populate_and_save_text_target(
         page, config_path, idx,
-        text=text, match_type=match_type, tag_hint=tag_hint,
+        text=primary_text, match_type=match_type, tag_hint=tag_hint,
     )
 
     if discovery.status == DiscoveryStatus.FOUND and discovery.selector:
@@ -657,7 +865,15 @@ async def run_automation():
                         val = os.environ.get(step.get("value_env", ""), "")
                         await reliable_type(page, selector, val, timeout=timeout)
                     elif action == "click":
-                        await reliable_click(page, selector, timeout=timeout)
+                        verify_password_submit = (
+                            step_name == "click_next_password")
+                        await reliable_click(
+                            page, selector, timeout=timeout,
+                            verify_page_change=verify_password_submit,
+                            disappearance_selector=(
+                                'input[type="password"]'
+                                if verify_password_submit else ""),
+                        )
                     success = True
                     print(f"[+] Successfully executed '{step_name}'.")
                     break

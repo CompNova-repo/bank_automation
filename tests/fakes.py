@@ -129,15 +129,41 @@ class FakePage:
     async def get_content(self) -> str:
         return f"<html><body>{self.body_text}</body></html>"
 
-    async def query_selector(self, selector: str) -> Optional[FakeElement]:
+    @staticmethod
+    def _normalize_selector(selector: str) -> str:
+        """Canonicalise selector variants the fake should treat as equal.
+
+        Browsers accept `li[data-challengetype='13']` and
+        `[data-challengetype="13"]` interchangeably, so the fake must too —
+        otherwise tests would over-specify selector string formatting.
+        """
+        if not selector:
+            return ""
+        out = selector.replace("'", '"').strip()
+        # Strip a leading "li " or "li>" prefix from attribute selectors so
+        # `li[data-challengetype="13"]` matches `[data-challengetype="13"]`.
+        if out.startswith("li[") and "]" in out:
+            out = out[2:]
+        return out
+
+    def _matched_selector(self, selector: str) -> Optional[str]:
+        """Return the registered key that matches `selector`, ignoring
+        quote-style and a leading `li` on attribute selectors."""
         if selector in self.selector_hidden:
             return None
         if selector in self.selectors:
-            return FakeElement(self, selector, self.selectors[selector])
-        # Real nodriver returns None for unknown selectors. Mimicking that
-        # is important so tests can prove a stored selector is genuinely
-        # broken (healing path) versus still resolving.
+            return selector
+        target = self._normalize_selector(selector)
+        for key in self.selectors.keys():
+            if self._normalize_selector(key) == target:
+                return key
         return None
+
+    async def query_selector(self, selector: str) -> Optional[FakeElement]:
+        matched = self._matched_selector(selector)
+        if matched is None:
+            return None
+        return FakeElement(self, matched, self.selectors[matched])
 
     async def select(self, selector: str, timeout: float = 8) -> Optional[FakeElement]:
         # Tests don't actually wait — return immediately to keep them fast.
@@ -182,14 +208,15 @@ class FakePage:
                 sel = json.loads(m.group(1))
             except Exception:
                 return 0
-            if sel in self.selector_hidden:
+            if self._matched_selector(sel) is None:
                 return 0
-            if sel in self.selectors:
-                return 1
-            return 0
+            return 1
         # document.querySelector(<sel>) -> getElementText probe
         m = re.search(r'document\.querySelector\("(.+?)"\)', js)
         if m:
             sel = m.group(1)
-            return self.selectors.get(sel, "")
+            matched = self._matched_selector(sel)
+            if matched is None:
+                return ""
+            return self.selectors[matched]
         return None
